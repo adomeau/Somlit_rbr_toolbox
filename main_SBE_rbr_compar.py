@@ -70,6 +70,9 @@ def main():
         rbr_root=str(RBR_OUTPUTS_DIR),
         sbe_root=str(SBE_COMPLETED_DIR),
         save_folder=str(COMPARAISON_FIGURES_DIR),
+        # SBE SOMLIT profiles are downcasts: compare RBR downcasts only.
+        # Use casts=("downcast", "upcast") to also plot RBR upcasts.
+        casts=("downcast",),
     )
 
     print("Programme terminé")

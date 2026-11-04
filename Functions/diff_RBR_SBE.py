@@ -412,6 +412,10 @@ def plot_and_save_comparisons_all_columns(df_sbe, df_rbr, depth_col='depth(m)', 
         df_rbr (pd.DataFrame): RBR dataset
         depth_col (str): Name of the depth column
         save_folder (str): Output directory
+
+    Returns:
+        list of dict: per parameter, number of common depths and median /
+        max |.| / RMS of the RBR - SBE difference
     """
     os.makedirs(save_folder, exist_ok=True)
 
@@ -425,13 +429,21 @@ def plot_and_save_comparisons_all_columns(df_sbe, df_rbr, depth_col='depth(m)', 
     common_depths = np.intersect1d(
         df_sbe[depth_col].dropna().unique(), df_rbr[depth_col].dropna().unique())
 
+    stats = []
+
     if len(common_depths) == 0:
         print("❌ No common depth values found between datasets.")
-        return
+        return stats
 
     # Filter both DataFrames to common depths
     df_sbe_common = df_sbe[df_sbe[depth_col].isin(common_depths)].copy()
     df_rbr_common = df_rbr[df_rbr[depth_col].isin(common_depths)].copy()
+
+    # A depth can appear twice in a file (e.g. SBE 2026-09-08 at 30.25 m):
+    # average duplicates so the merge below stays one row per depth instead
+    # of producing every RBR x SBE combination for that depth.
+    df_sbe_common = df_sbe_common.groupby(depth_col, as_index=False).mean(numeric_only=True)
+    df_rbr_common = df_rbr_common.groupby(depth_col, as_index=False).mean(numeric_only=True)
 
     # Sort by depth for plotting
     df_sbe_common = df_sbe_common.sort_values(depth_col)
@@ -447,7 +459,7 @@ def plot_and_save_comparisons_all_columns(df_sbe, df_rbr, depth_col='depth(m)', 
 
     if not common_cols:
         print("❌ No common numeric columns to compare.")
-        return
+        return stats
 
     for param in common_cols:
         print(f"📈 Processing '{param}'...")
@@ -507,6 +519,17 @@ def plot_and_save_comparisons_all_columns(df_sbe, df_rbr, depth_col='depth(m)', 
         plt.close(fig)
 
         print(f"✅ Saved: {fig_path_raw} and {fig_path_diff}")
+
+        valid = diff.dropna()
+        stats.append({
+            "parameter": param,
+            "n_common_depths": int(valid.size),
+            "diff_median": float(valid.median()) if valid.size else np.nan,
+            "diff_max_abs": float(valid.abs().max()) if valid.size else np.nan,
+            "diff_rms": float(np.sqrt(np.mean(valid ** 2))) if valid.size else np.nan,
+        })
+
+    return stats
 
 # %% plot_comparison_up_down
 # produces figures with up and down cast and both sbe and rbr data on the same graph, great
@@ -750,7 +773,17 @@ def match_rbr_sbe_by_date(rbr_root, sbe_root):
 
 # %% compare_all_matching_dates
 
-def compare_all_matching_dates(rbr_root, sbe_root, save_folder="figures_comparison_SBE_RBR"):
+def _cast_of(path):
+    """'downcast', 'upcast' or 'profile' from a *_4somlit_{d,u}.csv name."""
+    if path.endswith("_d.csv"):
+        return "downcast"
+    if path.endswith("_u.csv"):
+        return "upcast"
+    return "profile"
+
+
+def compare_all_matching_dates(rbr_root, sbe_root, save_folder="figures_comparison_SBE_RBR",
+                               casts=("downcast",)):
     '''
     Main entry point: automatically find every (RBR Somlit csv, SBE Somlit
     csv) pair that shares the same calendar date, and produce comparison
@@ -780,22 +813,42 @@ def compare_all_matching_dates(rbr_root, sbe_root, save_folder="figures_comparis
     save_folder : str, optional
         root folder where comparison figures are saved, one subfolder per
         date. Default "figures_comparison_SBE_RBR".
+    casts : tuple of str, optional
+        RBR casts to compare with the SBE: "downcast", "upcast". Default
+        downcast only, since the SBE SOMLIT profiles are downcasts.
+
+    The same RBR cast can be found several times under rbr_root when two
+    raw .rsk files overlap in time (e.g. an export of the whole season and
+    an earlier partial one): it is compared only once (same cast, same
+    first timestamp, same number of rows).
+
+    A summary of every comparison (one row per pair and parameter) is
+    written to <save_folder>/comparison_summary.csv.
 
     Returns
     -------
-    None
+    pandas.DataFrame
+        the summary table
     '''
     matches = match_rbr_sbe_by_date(rbr_root, sbe_root)
+    summary_rows = []
+    seen_casts = set()
 
     for entry in matches:
         date = entry["date"]
         date_str = date.strftime("%Y-%m-%d")
 
         for rbr_path, df_rbr in entry["rbr"]:
-            # "_4somlit_d.csv" -> downcast, "_4somlit_u.csv" -> upcast
-            cast = "downcast" if rbr_path.endswith("_d.csv") else \
-                   "upcast" if rbr_path.endswith("_u.csv") else "profile"
+            cast = _cast_of(rbr_path)
             rbr_label = os.path.splitext(os.path.basename(rbr_path))[0]
+            if cast not in casts:
+                continue
+            cast_key = (cast, df_rbr.index[0], len(df_rbr))
+            if cast_key in seen_casts:
+                print(f"[INFO] {rbr_label}: same cast already compared "
+                      f"(overlapping raw files), skipped.")
+                continue
+            seen_casts.add(cast_key)
 
             for sbe_path, df_sbe in entry["sbe"]:
                 sbe_label = os.path.splitext(os.path.basename(sbe_path))[0]
@@ -817,9 +870,21 @@ def compare_all_matching_dates(rbr_root, sbe_root, save_folder="figures_comparis
 
                 # ID_SITE isn't a physical measurement - drop it from the
                 # comparison so it isn't plotted as if it were a channel.
-                plot_and_save_comparisons_all_columns(
+                stats = plot_and_save_comparisons_all_columns(
                     df_sbe.drop(columns=["ID_SITE"], errors="ignore"),
                     df_rbr.drop(columns=["ID_SITE"], errors="ignore"),
                     depth_col="PROFONDEUR",
                     save_folder=pair_folder,
                 )
+                for row in stats or []:
+                    summary_rows.append({"date": date_str, "cast": cast,
+                                         "rbr_file": rbr_label,
+                                         "sbe_file": sbe_label, **row})
+
+    summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        os.makedirs(save_folder, exist_ok=True)
+        out = os.path.join(save_folder, "comparison_summary.csv")
+        summary.to_csv(out, index=False, float_format="%.4f")
+        print(f"\n📄 Summary written to {out}")
+    return summary
